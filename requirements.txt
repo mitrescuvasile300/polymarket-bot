@@ -1,0 +1,5 @@
+aiohttp>=3.9
+websockets>=12.0
+scipy>=1.12
+py-clob-client>=0.22
+python-dotenv>=1.0

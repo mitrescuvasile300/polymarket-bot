@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+*.pem
+secrets/
+
+# Logs (keep structure)
+logs/*.log
+logs/*.json
+!logs/.gitkeep
+
+# Data (keep structure)
+data/historical/*.csv
+data/historical/*.json
+!data/historical/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust (future)
+target/
+Cargo.lock
