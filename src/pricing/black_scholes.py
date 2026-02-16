@@ -113,8 +113,14 @@ def taker_fee(price: float) -> float:
 
 
 def min_edge_at_price(price: float) -> float:
-    """Minimum edge needed for profitability after round-trip taker fees."""
-    return 2 * taker_fee(price)
+    """
+    Minimum edge needed for profitability after taker fee.
+    
+    Note: only 1× fee, not 2×. In binary options, you buy tokens and hold 
+    to settlement — settlement pays $1.00 per winning share automatically.
+    There is no sell-side taker fee at resolution.
+    """
+    return taker_fee(price)
 
 
 # ============================================================

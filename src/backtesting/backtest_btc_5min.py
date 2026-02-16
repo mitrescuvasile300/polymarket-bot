@@ -83,13 +83,13 @@ class BacktestResult:
 # Data fetching
 # ============================================================
 
-async def fetch_kraken_ohlc(
+async def fetch_kraken_ohlc_page(
     session: aiohttp.ClientSession,
     pair: str = "XBTUSD",
     interval: int = 1,
     since: int = 0,
-) -> list[dict]:
-    """Fetch historical OHLC from Kraken."""
+) -> tuple[list[dict], int]:
+    """Fetch a single page of OHLC from Kraken. Returns (candles, last_timestamp)."""
     params = {"pair": pair, "interval": interval}
     if since:
         params["since"] = since
@@ -103,9 +103,10 @@ async def fetch_kraken_ohlc(
             if resp.status == 200:
                 data = await resp.json()
                 result = data.get('result', {})
+                last_ts = result.get('last', 0)
                 for key in result:
                     if key != 'last':
-                        return [{
+                        candles = [{
                             'open_time': int(k[0]),
                             'open': float(k[1]),
                             'high': float(k[2]),
@@ -113,9 +114,58 @@ async def fetch_kraken_ohlc(
                             'close': float(k[4]),
                             'volume': float(k[6]),
                         } for k in result[key]]
+                        return candles, last_ts
     except Exception as e:
         print(f"  Kraken fetch error: {e}")
-    return []
+    return [], 0
+
+
+async def fetch_kraken_ohlc(
+    session: aiohttp.ClientSession,
+    pair: str = "XBTUSD",
+    interval: int = 1,
+    since: int = 0,
+    end_ts: int = 0,
+) -> list[dict]:
+    """
+    Fetch historical OHLC from Kraken with pagination.
+    
+    Kraken returns max 720 candles per request. We paginate using the 
+    'last' field from each response as the 'since' for the next request.
+    """
+    all_candles = []
+    cursor = since
+    target_end = end_ts or int(time.time())
+    max_pages = 20  # Safety limit
+    
+    for page in range(max_pages):
+        candles, last_ts = await fetch_kraken_ohlc_page(session, pair, interval, cursor)
+        
+        if not candles:
+            break
+        
+        # Filter to requested range
+        filtered = [c for c in candles if c['open_time'] <= target_end]
+        all_candles.extend(filtered)
+        
+        # Check if we've covered the range
+        latest_ts = max(c['open_time'] for c in candles)
+        if latest_ts >= target_end or last_ts == 0 or last_ts <= cursor:
+            break
+        
+        cursor = last_ts
+        print(f"  Page {page + 1}: {len(all_candles)} candles total (up to {datetime.fromtimestamp(latest_ts, tz=timezone.utc).strftime('%m-%d %H:%M')})")
+        await asyncio.sleep(1)  # Rate limit (Kraken allows ~1 req/s for public)
+    
+    # Deduplicate by open_time
+    seen = set()
+    unique = []
+    for c in all_candles:
+        if c['open_time'] not in seen:
+            seen.add(c['open_time'])
+            unique.append(c)
+    
+    return sorted(unique, key=lambda c: c['open_time'])
 
 
 # ============================================================
@@ -187,7 +237,9 @@ def compute_rolling_vol(windows: list[dict], lookback: int = 100) -> list[float]
             vols.append(0.45)
             continue
         
-        variance = sum(r ** 2 for r in returns) / len(returns)
+        # Bessel-corrected variance (subtract mean, N-1 denominator)
+        mean_r = sum(returns) / len(returns)
+        variance = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
         periods_per_year = SECONDS_PER_YEAR / 300
         annual_vol = math.sqrt(variance * periods_per_year)
         vols.append(max(0.15, min(1.50, annual_vol)))
@@ -391,12 +443,17 @@ def run_backtest(
         t = best_trade
         
         # Determine outcome
+        # FIX: real cost per share = ask + fee (fee charged on top of price)
+        cost_per_share = t['ask'] + t['fee']
+        shares = t['bet'] / cost_per_share
+        
         won = (t['side'] == w['result'])
         if won:
-            shares = t['bet'] / t['ask']
-            pnl = shares * (1.0 - t['ask']) - shares * t['fee']
+            # Winning shares pay $1.00, we paid (ask + fee) per share
+            pnl = shares * (1.0 - cost_per_share)
             consecutive_losses = 0
         else:
+            # Losing shares pay $0.00, we lose entire cost
             pnl = -t['bet']
             consecutive_losses += 1
         

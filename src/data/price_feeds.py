@@ -154,8 +154,11 @@ class BTCPriceFeed:
         if avg_dt <= 0:
             return
         
-        # Variance of returns (assume zero mean for short intervals)
-        variance = sum(r ** 2 for _, r in returns) / len(returns)
+        # Variance with Bessel's correction (subtract mean, divide by N-1)
+        # Avoids overestimating vol during trending periods
+        log_returns = [r for _, r in returns]
+        mean_r = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean_r) ** 2 for r in log_returns) / (len(log_returns) - 1)
         periods_per_year = SECONDS_PER_YEAR / avg_dt
         annual_variance = variance * periods_per_year
         self.vol_annualized = math.sqrt(max(annual_variance, 0))

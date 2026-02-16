@@ -98,13 +98,24 @@ class LiveScanner:
         edge_up = p_up_fair - up_ask - fee_up
         edge_down = p_down_fair - down_ask - fee_down
         
-        # Maker edges (post at bid, zero fees)
-        edge_up_maker = p_up_fair - up.get('bid', 0)
-        edge_down_maker = p_down_fair - down.get('bid', 0)
+        # Maker edges: as a maker, we POST limit buy orders below the ask.
+        # Our bid would be at BS fair value minus a small margin.
+        # Edge = fair_value - our_posted_bid (positive = we're buying cheap)
+        # For simplicity, estimate maker buy edge as: fair - (best_ask - spread/2)
+        # Zero maker fees + we earn rebates from taker fees paid against us.
+        up_best_ask = up.get('ask', 1.0)
+        down_best_ask = down.get('ask', 1.0)
+        up_spread = up.get('spread', 0)
+        down_spread = down.get('spread', 0)
+        # If we post a bid at midpoint, our edge buying Up:
+        up_maker_bid = up_best_ask - up_spread / 2 if up_spread > 0 else up.get('bid', 0)
+        down_maker_bid = down_best_ask - down_spread / 2 if down_spread > 0 else down.get('bid', 0)
+        edge_up_maker = p_up_fair - up_maker_bid  # positive = buying below fair value
+        edge_down_maker = p_down_fair - down_maker_bid
         
-        # Kelly sizing
-        kelly_up = kelly_bet_size(p_up_fair, up_ask, self.bankroll)
-        kelly_down = kelly_bet_size(p_down_fair, down_ask, self.bankroll)
+        # Kelly sizing (now with fees)
+        kelly_up = kelly_bet_size(p_up_fair, up_ask, self.bankroll, fee=fee_up)
+        kelly_down = kelly_bet_size(p_down_fair, down_ask, self.bankroll, fee=fee_down)
         
         # Arbitrage check (buy both sides)
         arb_cost = up_ask + down_ask
