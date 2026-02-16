@@ -28,6 +28,7 @@ from src.pricing.black_scholes import bs_binary_price, taker_fee, SECONDS_PER_YE
 from src.pricing.kelly import kelly_bet_size, edge_summary
 from src.data.price_feeds import BTCPriceFeed
 from src.data.polymarket_api import PolymarketClient
+from src.data.window_tracker import WindowTracker
 
 
 class LiveScanner:
@@ -35,6 +36,7 @@ class LiveScanner:
     
     def __init__(self, bankroll: float = BANKROLL):
         self.btc = BTCPriceFeed()
+        self.window_tracker = WindowTracker()
         self.bankroll = bankroll
         self.scan_count = 0
         self.opportunities: list[dict] = []
@@ -69,13 +71,15 @@ class LiveScanner:
             return None
         
         # Strike price K = BTC at window open
-        # We approximate K ≈ current BTC when market is ATM (freshly opened)
-        # A better approach: cache K at window open or derive from prices
-        # When Up ≈ 0.50, the market is ATM → K ≈ S
-        # When Up > 0.50, BTC has moved up from K → K < S
-        # We can estimate K from the market mid and BS inversion
-        up_mid = up.get('mid') or 0.5
-        K = btc_price  # Base approximation
+        # Use WindowTracker for best estimate
+        up_mid = up.get('mid')
+        K, k_source = self.window_tracker.get_best_strike(
+            window_start,
+            btc_price,
+            market_up_mid=up_mid,
+            sigma=self.btc.vol_annualized,
+            time_remaining_sec=time_left_sec,
+        )
         
         # Better K estimation: if we know σ and the market price, invert BS
         # For now, use the approximation. The scanner will flag when market
@@ -110,6 +114,9 @@ class LiveScanner:
             'slug': market['slug'],
             'time_left': time_left_sec,
             'btc_price': btc_price,
+            'strike': K,
+            'strike_source': k_source,
+            'btc_delta_pct': (btc_price - K) / K * 100 if K > 0 else 0,
             'sigma': sigma,
             'bs_up': p_up_fair,
             'bs_down': p_down_fair,
@@ -134,8 +141,12 @@ class LiveScanner:
         up = a['up']
         down = a['down']
         
+        delta_pct = a.get('btc_delta_pct', 0)
+        k_src = a.get('strike_source', '?')
+        
         lines.append(f"\n{'='*72}")
-        lines.append(f"📊 {a['slug']} | ⏱️{t:3d}s | BTC ${a['btc_price']:,.2f} | σ={a['sigma']:.1%}")
+        lines.append(f"📊 {a['slug']} | ⏱️{t:3d}s | BTC ${a['btc_price']:,.2f} | K=${a.get('strike',0):,.2f} ({k_src})")
+        lines.append(f"   Δ={delta_pct:+.3f}% | σ={a['sigma']:.1%}")
         lines.append(f"{'─'*72}")
         
         # Price table
@@ -158,6 +169,10 @@ class LiveScanner:
         if a['arb_profit'] > 0:
             lines.append(f"  🔥 ARB: Buy both @ {up.get('ask',0)+down.get('ask',0):.4f} → profit {a['arb_profit']*100:.2f}%")
         
+        # Wide spread warning
+        if up.get('spread', 0) > 0.30 or down.get('spread', 0) > 0.30:
+            lines.append(f"  ⚠️ WIDE SPREAD ({up.get('spread',0):.2f} / {down.get('spread',0):.2f}) — market likely illiquid or just opened")
+        
         best_taker = max(a['edge_up_taker'], a['edge_down_taker'])
         if best_taker > MIN_EDGE:
             side = 'UP' if a['edge_up_taker'] > a['edge_down_taker'] else 'DOWN'
@@ -179,6 +194,9 @@ class LiveScanner:
         if btc_price <= 0:
             print(f"[{now_dt.strftime('%H:%M:%S')}] ⚠️ No BTC price")
             return
+        
+        # Track window strikes
+        self.window_tracker.update_price(btc_price)
         
         stats = self.btc.get_5min_stats()
         print(f"\n[{now_dt.strftime('%H:%M:%S')} UTC] Scan #{self.scan_count} | BTC ${btc_price:,.2f} | σ={stats['vol_annualized']:.1%} | ±${stats['expected_move_usd']:.0f}/5min | src={stats['source']} | opps={len(self.opportunities)}")
