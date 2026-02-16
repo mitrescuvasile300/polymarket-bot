@@ -12,6 +12,7 @@ These replace REST polling (5s delay → sub-10ms).
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -22,7 +23,13 @@ from config.settings import (
     BINANCE_WS,
     RTDS_WS,
     CLOB_WS,
+    VOL_LOOKBACK,
+    VOL_MIN,
+    VOL_MAX,
+    VOL_DEFAULT,
 )
+
+SECONDS_PER_YEAR = 365.25 * 24 * 3600
 
 logger = logging.getLogger(__name__)
 
@@ -459,9 +466,12 @@ class CLOBBookStream:
             finally:
                 if self._session and not self._session.closed:
                     await self._session.close()
+                # Clear stale book data on disconnect to prevent trading on
+                # outdated orderbook state during reconnection gap
+                self.books.clear()
             
             if self._running:
-                logger.info("CLOB WS reconnecting in 2s...")
+                logger.info("CLOB WS reconnecting in 2s (books cleared)...")
                 await asyncio.sleep(2)
     
     async def _subscribe_tokens(self, token_ids: list[str]):
@@ -572,6 +582,10 @@ class PriceFeedManager:
         self.btc_timestamp: float = 0.0
         self.chainlink_timestamp: float = 0.0
         
+        # Rolling price history for realized vol calculation
+        self._price_history: list[tuple[float, float]] = []  # (timestamp, price)
+        self.realized_vol: float = VOL_DEFAULT  # Annualized realized volatility
+        
         # Callbacks for the scanner/trader
         self._price_callbacks: list[Callable] = []
         self._book_callbacks: list[Callable] = []
@@ -610,9 +624,18 @@ class PriceFeedManager:
         )
         logger.info("All feeds stopped")
     
-    def get_book(self, token_id: str) -> Optional[BookUpdate]:
-        """Get latest order book for a token."""
-        return self.clob.books.get(token_id)
+    def get_book(self, token_id: str, max_age_seconds: float = 5.0) -> Optional[BookUpdate]:
+        """
+        Get latest order book for a token, with staleness check.
+        
+        Returns None if book data is older than max_age_seconds to prevent
+        trading on stale orderbook during WebSocket reconnection gaps.
+        """
+        book = self.clob.books.get(token_id)
+        if book and (time.time() - book.timestamp) > max_age_seconds:
+            logger.debug(f"Book for {token_id[:16]}... is stale ({time.time() - book.timestamp:.1f}s old)")
+            return None
+        return book
     
     @property
     def divergence(self) -> float:
@@ -635,16 +658,64 @@ class PriceFeedManager:
             'chainlink_price': self.chainlink_price,
             'divergence_usd': self.divergence,
             'divergence_pct': f"{self.divergence_pct:.4f}%",
+            'realized_vol': self.realized_vol,
+            'vol_data_points': len(self._price_history),
             'binance_trades': self.binance.trade_count,
             'rtds_updates': self.rtds.update_count,
             'clob_updates': self.clob.update_count,
             'active_books': len(self.clob.books),
         }
     
+    def _compute_realized_vol(self):
+        """
+        Compute rolling realized volatility from WebSocket price history.
+        
+        Uses Bessel-corrected log returns, annualized by time-weighting.
+        Same methodology as BTCPriceFeed but operates on WS data.
+        """
+        if len(self._price_history) < 10:
+            return
+        
+        # Compute log returns
+        returns = []
+        for i in range(1, len(self._price_history)):
+            t0, p0 = self._price_history[i - 1]
+            t1, p1 = self._price_history[i]
+            dt = t1 - t0
+            if dt > 0 and p0 > 0 and p1 > 0:
+                log_return = math.log(p1 / p0)
+                returns.append((dt, log_return))
+        
+        if len(returns) < 5:
+            return
+        
+        avg_dt = sum(dt for dt, _ in returns) / len(returns)
+        if avg_dt <= 0:
+            return
+        
+        # Bessel-corrected variance
+        log_returns = [r for _, r in returns]
+        mean_r = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean_r) ** 2 for r in log_returns) / (len(log_returns) - 1)
+        periods_per_year = SECONDS_PER_YEAR / avg_dt
+        annual_variance = variance * periods_per_year
+        vol = math.sqrt(max(annual_variance, 0))
+        
+        # Clamp to reasonable range
+        self.realized_vol = max(VOL_MIN, min(VOL_MAX, vol))
+    
     # Internal callbacks
     def _on_binance_price(self, price: float, ts_ms: int):
         self.btc_price = price
         self.btc_timestamp = ts_ms / 1000.0
+        
+        # Record for rolling vol calculation
+        ts = ts_ms / 1000.0
+        self._price_history.append((ts, price))
+        if len(self._price_history) > VOL_LOOKBACK * 2:
+            self._price_history = self._price_history[-VOL_LOOKBACK * 2:]
+        self._compute_realized_vol()
+        
         for cb in self._price_callbacks:
             try:
                 cb(price, 'binance')

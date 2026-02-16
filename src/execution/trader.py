@@ -26,6 +26,7 @@ from py_clob_client.clob_types import (
 )
 
 from config.settings import MIN_SHARES
+from src.pricing.black_scholes import taker_fee
 from src.execution.positions import PositionTracker, OpenOrder
 from src.execution.heartbeat import HeartbeatManager
 from src.risk.manager import RiskManager, TradeRecord
@@ -97,10 +98,10 @@ class Trader:
         self.heartbeat = HeartbeatManager(self.client)
         self.heartbeat.start()
     
-    def disable_heartbeat(self):
+    async def disable_heartbeat(self):
         """Stop heartbeat manager."""
         if self.heartbeat:
-            self.heartbeat.stop()
+            await self.heartbeat.stop()
     
     # ================================================================
     # Limit Orders (GTC) — for market making
@@ -515,7 +516,9 @@ class Trader:
         Returns:
             OrderResult
         """
-        shares = bet_size_usd / ask_price
+        # Account for taker fee in share count: real cost = ask + fee per share
+        fee = taker_fee(ask_price)
+        shares = bet_size_usd / (ask_price + fee)
         
         if shares < MIN_SHARES:
             return OrderResult(

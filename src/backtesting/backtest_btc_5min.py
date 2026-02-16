@@ -405,7 +405,7 @@ def run_backtest(
             edge = bs_fair - ask - fee
             
             if edge > min_edge:
-                bet = kelly_bet_size(bs_fair, ask, current_bankroll)
+                bet = kelly_bet_size(bs_fair, ask, current_bankroll, fee=fee)
                 if bet > 0:
                     best_trade = {
                         'minute_idx': minute_idx,

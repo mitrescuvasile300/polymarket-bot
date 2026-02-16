@@ -3,17 +3,17 @@ Heartbeat manager for Polymarket CLOB.
 
 CRITICAL: If heartbeats are started and one isn't sent within 10 seconds,
 Polymarket CANCELS ALL open orders automatically. This module ensures
-heartbeats are sent reliably on a background thread.
+heartbeats are sent reliably via asyncio task (no thread safety issues).
 
 Usage:
     hb = HeartbeatManager(clob_client)
-    hb.start()           # Begin heartbeat loop
+    hb.start()           # Begin heartbeat loop (asyncio task)
     ...
-    hb.stop()            # Clean shutdown
+    await hb.stop()      # Clean shutdown
 """
 
+import asyncio
 import logging
-import threading
 import time
 import uuid
 from typing import Optional
@@ -32,8 +32,8 @@ class HeartbeatManager:
     """
     Sends periodic heartbeats to keep open orders alive.
     
-    Runs on a daemon thread so it doesn't block the main event loop.
-    Automatically stops and logs errors on failure.
+    Uses asyncio task (not threading) to avoid sharing ClobClient
+    across threads which could corrupt request state.
     """
     
     def __init__(
@@ -45,8 +45,7 @@ class HeartbeatManager:
         self.interval = interval
         self.heartbeat_id: str = str(uuid.uuid4())
         
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
+        self._task: Optional[asyncio.Task] = None
         self._is_running = False
         self._consecutive_failures = 0
         self._total_sent = 0
@@ -64,42 +63,43 @@ class HeartbeatManager:
         return time.time() - self._last_sent
     
     def start(self):
-        """Start the heartbeat background thread."""
+        """Start the heartbeat asyncio task."""
         if self._is_running:
             logger.warning("Heartbeat already running")
             return
         
-        self._stop_event.clear()
         self._is_running = True
         self._consecutive_failures = 0
         self.heartbeat_id = str(uuid.uuid4())
         
-        self._thread = threading.Thread(
-            target=self._heartbeat_loop,
-            name="polymarket-heartbeat",
-            daemon=True,
-        )
-        self._thread.start()
+        self._task = asyncio.ensure_future(self._heartbeat_loop())
         logger.info(f"Heartbeat started (id={self.heartbeat_id[:8]}..., interval={self.interval}s)")
     
-    def stop(self):
-        """Stop the heartbeat thread gracefully."""
+    async def stop(self):
+        """Stop the heartbeat task gracefully."""
         if not self._is_running:
             return
         
-        self._stop_event.set()
         self._is_running = False
         
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=self.interval + 2)
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         
         logger.info(f"Heartbeat stopped (sent {self._total_sent} total)")
     
-    def _heartbeat_loop(self):
-        """Main heartbeat loop running on background thread."""
-        while not self._stop_event.is_set():
+    async def _heartbeat_loop(self):
+        """Main heartbeat loop as asyncio coroutine."""
+        while self._is_running:
             try:
-                response = self.client.post_heartbeat(self.heartbeat_id)
+                # Run blocking CLOB call in thread pool to not block event loop
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None, self.client.post_heartbeat, self.heartbeat_id
+                )
                 self._total_sent += 1
                 self._last_sent = time.time()
                 self._consecutive_failures = 0
@@ -107,6 +107,8 @@ class HeartbeatManager:
                 if self._total_sent % 100 == 0:
                     logger.debug(f"Heartbeat #{self._total_sent} OK")
                     
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 self._consecutive_failures += 1
                 self._last_error = str(e)
@@ -122,8 +124,10 @@ class HeartbeatManager:
                     self._is_running = False
                     break
             
-            # Wait for interval or stop signal
-            self._stop_event.wait(timeout=self.interval)
+            try:
+                await asyncio.sleep(self.interval)
+            except asyncio.CancelledError:
+                break
     
     def status(self) -> dict:
         """Get heartbeat status."""

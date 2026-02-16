@@ -154,7 +154,7 @@ async def run_bot(args):
         # Clean shutdown
         logger.info("Shutting down...")
         trader.cancel_all_orders()
-        trader.disable_heartbeat()
+        await trader.disable_heartbeat()
         await feeds.stop()
         
         # Final summary

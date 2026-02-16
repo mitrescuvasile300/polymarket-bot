@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from enum import Enum
 from typing import Optional, Callable
 
@@ -144,6 +144,7 @@ class WindowLifecycleManager:
         self.windows_scanned: int = 0
         self.windows_traded: int = 0
         self.total_pnl: float = 0.0
+        self._current_date: date = datetime.now(timezone.utc).date()
     
     async def run(
         self,
@@ -189,6 +190,13 @@ class WindowLifecycleManager:
         scan_interval: float,
     ):
         """Process one complete 5-minute window cycle."""
+        # Daily reset: reset risk manager counters at UTC midnight
+        today = datetime.now(timezone.utc).date()
+        if today != self._current_date:
+            logger.info(f"📅 New day ({today}) — resetting daily risk counters")
+            self.trader.risk.reset_daily()
+            self._current_date = today
+        
         now = time.time()
         current_window_ts = (int(now) // WINDOW_SECONDS) * WINDOW_SECONDS
         next_window_ts = current_window_ts + WINDOW_SECONDS
@@ -289,7 +297,7 @@ class WindowLifecycleManager:
             
             # Calculate BS fair value
             T_remaining = (session.window_end - now) / SECONDS_PER_YEAR
-            sigma = 0.45  # TODO: use rolling realized vol from feeds
+            sigma = self.feeds.realized_vol  # Rolling realized vol from WebSocket data
             session.sigma = sigma
             
             p_up_fair, p_down_fair = bs_binary_price(
@@ -411,12 +419,24 @@ class WindowLifecycleManager:
             self.trader.cancel_market_orders(market_slug=session.slug)
         
         # Phase 5: SETTLEMENT
-        # Wait for window to fully expire
+        # Snapshot the Chainlink price at the exact window boundary (not after a delay)
+        # This is critical — BTC can move $50-100 in a few seconds
+        settlement_price = 0.0
         if session.time_remaining > 0:
-            await asyncio.sleep(session.time_remaining + 2)
+            # Wait until just at the boundary, then snapshot
+            remaining = session.time_remaining
+            if remaining > 0.1:
+                await asyncio.sleep(remaining - 0.05)
+            # Capture price at boundary
+            settlement_price = self.feeds.chainlink_price or self.feeds.btc_price
+            # Wait a bit more for settlement to propagate
+            await asyncio.sleep(2)
+        else:
+            # Window already expired, use current price (best we can do)
+            settlement_price = self.feeds.chainlink_price or self.feeds.btc_price
         
         # Determine settlement (BTC above or below K?)
-        final_btc = self.feeds.chainlink_price or self.feeds.btc_price
+        final_btc = settlement_price
         btc_went_up = final_btc > session.strike_used
         
         # Settle positions
